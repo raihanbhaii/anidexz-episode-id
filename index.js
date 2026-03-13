@@ -44,6 +44,7 @@ http.createServer(async (req, res) => {
       episodeId: ep.episodeId,
       episodeNumber: epNum,
       totalEpisodes: episodes.length,
+      url: `${BASE}/watch/${animeId}?ep=${ep.episodeId}`,
     });
   } catch (e) {
     console.error("[handler] error:", e);
