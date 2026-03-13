@@ -13,49 +13,82 @@ const PORT = process.env.PORT || 3000;
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
+  const path = url.pathname.replace(/\/+$/, ""); // strip trailing slashes
 
-  if (url.pathname !== "/api/episode") {
-    return send(res, 404, { error: "Not found. Use GET /api/episode?title=...&ep=N" });
+  // Health check for Render's uptime pings
+  if (path === "" || path === "/") {
+    return send(res, 200, { status: "ok" });
+  }
+
+  if (path !== "/api/episode") {
+    return send(res, 404, { error: "Use GET /api/episode?title=...&ep=N" });
   }
 
   const title = (url.searchParams.get("title") || "").trim();
   const epNum = parseInt(url.searchParams.get("ep"), 10);
 
   if (!title) return send(res, 400, { error: "Missing param: title" });
-  if (isNaN(epNum) || epNum < 1) return send(res, 400, { error: "Missing param: ep" });
+  if (isNaN(epNum) || epNum < 1) return send(res, 400, { error: "Missing param: ep (must be a number >= 1)" });
+
+  console.log(`[request] title="${title}" ep=${epNum}`);
 
   try {
     let animeId = null;
 
-    // Try AJAX suggest first
-    const ajaxRes = await fetch(`${BASE}/ajax/search/suggest?keyword=${encodeURIComponent(title)}`, {
-      headers: { ...H, Accept: "application/json, text/plain, */*", "X-Requested-With": "XMLHttpRequest" },
-    });
-    if (ajaxRes.ok) {
-      const ajaxData = await ajaxRes.json();
-      animeId = extractId(ajaxData.html || "", title);
+    // Step 1: Try AJAX suggest
+    try {
+      const ajaxRes = await fetch(`${BASE}/ajax/search/suggest?keyword=${encodeURIComponent(title)}`, {
+        headers: { ...H, Accept: "application/json, text/plain, */*", "X-Requested-With": "XMLHttpRequest" },
+      });
+      if (ajaxRes.ok) {
+        const ajaxData = await ajaxRes.json();
+        animeId = extractId(ajaxData.html || "", title);
+        if (animeId) console.log(`[search] found via AJAX: ${animeId}`);
+      }
+    } catch (e) {
+      console.warn("[search] AJAX suggest failed:", e.message);
     }
 
-    // Fallback: scrape search page
+    // Step 2: Fallback to search page
     if (!animeId) {
-      const pageRes = await fetch(`${BASE}/search?keyword=${encodeURIComponent(title)}`, { headers: H });
-      animeId = extractId(await pageRes.text(), title);
+      try {
+        const pageRes = await fetch(`${BASE}/search?keyword=${encodeURIComponent(title)}`, { headers: H });
+        animeId = extractId(await pageRes.text(), title);
+        if (animeId) console.log(`[search] found via page: ${animeId}`);
+      } catch (e) {
+        console.warn("[search] page scrape failed:", e.message);
+      }
     }
 
-    if (!animeId) return send(res, 404, { error: `Anime not found: "${title}"` });
+    if (!animeId) {
+      console.log(`[search] no match for: "${title}"`);
+      return send(res, 404, { error: `Anime not found: "${title}"` });
+    }
 
+    // Step 3: Fetch episode list
     const numId = animeId.match(/(\d+)$/)?.[1];
-    const epRes = await fetch(`${BASE}/ajax/v2/episode/list/${numId}`, {
-      headers: { ...H, Accept: "application/json, text/plain, */*", "X-Requested-With": "XMLHttpRequest", Referer: `${BASE}/${animeId}` },
-    });
-    if (!epRes.ok) return send(res, 502, { error: `Episode list failed: ${epRes.status}` });
+    let epData;
+    try {
+      const epRes = await fetch(`${BASE}/ajax/v2/episode/list/${numId}`, {
+        headers: { ...H, Accept: "application/json, text/plain, */*", "X-Requested-With": "XMLHttpRequest", Referer: `${BASE}/${animeId}` },
+      });
+      if (!epRes.ok) {
+        console.error(`[episodes] fetch failed: ${epRes.status}`);
+        return send(res, 502, { error: `Could not fetch episodes (upstream ${epRes.status})` });
+      }
+      epData = await epRes.json();
+    } catch (e) {
+      console.error("[episodes] fetch error:", e.message);
+      return send(res, 502, { error: "Could not reach AniWatch: " + e.message });
+    }
 
-    const epData = await epRes.json();
     const episodes = parseEpisodes(epData.html || "");
-    if (!episodes.length) return send(res, 404, { error: "No episodes found" });
+    console.log(`[episodes] found ${episodes.length} episodes for ${animeId}`);
+
+    if (!episodes.length) return send(res, 404, { error: "No episodes found for this anime" });
 
     const ep = episodes.find(e => e.number === epNum);
-    if (!ep) return send(res, 404, { error: `Episode ${epNum} not found. Available: 1–${episodes.length}` });
+    if (!ep) return send(res, 404, { error: `Episode ${epNum} not found. Available: 1-${episodes.length}` });
 
     send(res, 200, {
       episodeId: ep.episodeId,
@@ -63,9 +96,12 @@ http.createServer(async (req, res) => {
       totalEpisodes: episodes.length,
       url: `${BASE}/watch/${animeId}?ep=${ep.episodeId}`,
     });
+
   } catch (e) {
+    console.error("[handler] unexpected error:", e);
     send(res, 500, { error: "Internal error: " + e.message });
   }
+
 }).listen(PORT, () => console.log(`Running on port ${PORT}`));
 
 function extractId(html, query) {
@@ -97,6 +133,7 @@ function extractId(html, query) {
   const q = query.toLowerCase().trim();
   const qWords = q.split(/\s+/).filter(Boolean);
   const qSlug = q.replace(/\s+/g, "-");
+  const queryHasSeason = /\b(season\s*\d|s\d|part\s*\d|\d+(nd|rd|th)\s*season)\b/i.test(query);
 
   let best = null, bestScore = -1;
   for (const c of candidates) {
@@ -106,6 +143,11 @@ function extractId(html, query) {
     else if (name.startsWith(q) || slug.startsWith(qSlug)) score += 70;
     else if (name.includes(q) || slug.includes(qSlug)) score += 50;
     score += (qWords.filter(w => name.includes(w) || slug.includes(w)).length / qWords.length) * 40;
+    if (!queryHasSeason) {
+      const isSequel = /\b(season [2-9]|[2-9](nd|rd|th) season|part [2-9]|cour [2-9])\b/.test(name)
+        || /-(season|part)-[2-9]/.test(slug);
+      if (isSequel) score -= 60;
+    }
     if (score > bestScore) { bestScore = score; best = c; }
   }
 
