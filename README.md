@@ -80,7 +80,7 @@ A **dead-simple REST API** built in pure Node.js with **zero dependencies** that
 > Hit this right now 👇
 
 ```bash
-curl "https://anidexz-episode-id.onrender.com/api/episode?title=Solo+Leveling&ep=1"
+curl "https://yourweb.onrender.com/api/episode?title=Solo+Leveling&ep=1"
 ```
 
 ```json
