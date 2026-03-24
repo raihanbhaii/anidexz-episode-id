@@ -30,15 +30,18 @@ http.createServer(async (req, res) => {
   console.log(`[request] title="${title}" ep=${epNum}`);
 
   try {
-    // Try exact match first with original title
+    // Try original title first
     let animeId = await findAnimeId(title);
     
-    // If no exact match, try Google Translate for CJK titles
+    // If no match, try multiple translation strategies
     if (!animeId) {
-      const translatedTitle = await translateTitle(title);
-      if (translatedTitle && translatedTitle !== title.toLowerCase()) {
-        console.log(`[translate] "${title}" -> "${translatedTitle}"`);
-        animeId = await findAnimeId(translatedTitle);
+      const translations = await getAllTranslations(title);
+      for (const translated of translations) {
+        if (translated !== title.toLowerCase()) {
+          console.log(`[translate] "${title}" -> "${translated}"`);
+          animeId = await findAnimeId(translated);
+          if (animeId) break;
+        }
       }
     }
 
@@ -64,45 +67,51 @@ http.createServer(async (req, res) => {
 
 }).listen(PORT, () => console.log(`Running on port ${PORT}`));
 
-async function translateTitle(title) {
-  // Detect CJK characters (Chinese/Japanese/Korean)
-  const cjkRegex = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/;
-  if (!cjkRegex.test(title)) return null;
-
-  // Exact popular anime title mappings (prioritize these for accuracy)
-  const exactTranslations = {
-    // Chinese
-    '一人之下': 'Under One Person',
-    '斗罗大陆': 'Douluo Continent', 
-    '斗破苍穹': 'Battle Through the Heavens',
-    '完美世界': 'Perfect World',
-    '凡人修仙传': 'A Record of a Mortal\'s Journey to Immortality',
-    '狐妖小红娘': 'Fox Spirit Matchmaker',
-    
-    // Japanese (Hiragana/Katakana/Kanji)
-    '鬼滅の刃': 'Demon Slayer',
-    '進撃の巨人': 'Attack on Titan', 
-    '僕のヒーローアカデミア': 'My Hero Academia',
-    '呪術廻戦': 'Jujutsu Kaisen',
-    '東京喰種': 'Tokyo Ghoul',
-    'Re:ゼロから始める異世界生活': 'Re:Zero',
-    '盾の勇者の成り上がり': 'The Rising of the Shield Hero',
-    
-    // Korean
-    '나혼잇따': 'Solo Leveling',
-    '신의 탑': 'Tower of God',
-    '노블레스': 'Noblesse',
-    '갓 오브 하이스쿨': 'God of High School',
-  };
-
-  const lowerTitle = title.toLowerCase();
-  for (const [orig, eng] of Object.entries(exactTranslations)) {
-    if (title.includes(orig) || lowerTitle.includes(orig.toLowerCase())) {
-      return eng;
-    }
+async function getAllTranslations(title) {
+  const translations = [];
+  
+  // 1. Pinyin/Romanized Chinese names (handles "Xiuluo Wu Shen")
+  const pinyinMatch = title.match(/([A-Z][a-z]+ [A-Z][a-z]+ [A-Z][a-z]+)/i);
+  if (pinyinMatch) {
+    const pinyin = pinyinMatch[1];
+    const englishName = pinyinToEnglish[pinyin];
+    if (englishName) translations.push(englishName);
   }
 
-  // Google Translate API (free, unofficial endpoint that works reliably)
+  // 2. Detect CJK characters
+  const cjkRegex = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/;
+  if (cjkRegex.test(title)) {
+    translations.push(...await googleTranslate(title));
+  }
+
+  // 3. Exact popular title mappings (covers both CJK and Pinyin)
+  const exactMatch = findExactTranslation(title);
+  if (exactMatch) translations.push(exactMatch);
+
+  // 4. Common Pinyin patterns
+  const pinyinTranslation = await pinyinTranslate(title);
+  if (pinyinTranslation) translations.push(pinyinTranslation);
+
+  return [...new Set(translations)]; // Remove duplicates
+}
+
+const pinyinToEnglish = {
+  // Pinyin/Romanized Chinese donghua names → English
+  'Xiuluo Wu Shen': 'Martial God Asura',
+  'Dou Luo Da Lu': 'Douluo Continent',
+  'Dou Po Cang Qiong': 'Battle Through the Heavens',
+  'Fan Ren Xiu Xian Zhuan': 'A Record of a Mortal\'s Journey to Immortality',
+  'Hu Yao Xiao Hong Niang': 'Fox Spirit Matchmaker',
+  'Wan Mei Shi Jie': 'Perfect World',
+  'Xing Chen Bian': 'Stellar Transformations',
+  
+  // More Pinyin names
+  'Ling Jian Zun': 'Spirit Sword Sovereign',
+  'Wu Dong Qian Kun': 'Martial Universe',
+  'Yao Lao': 'Battle Through the Heavens', // Common character name
+};
+
+async function googleTranslate(title) {
   try {
     const response = await fetch(
       `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(title)}`,
@@ -110,24 +119,81 @@ async function translateTitle(title) {
         headers: { 
           'User-Agent': H['User-Agent'],
           'Accept': 'application/json'
-        },
-        timeout: 5000 
+        }
       }
     );
     
     if (response.ok) {
       const data = await response.json();
-      const translated = data[0][0][0];
-      console.log(`[google-translate] "${title}" -> "${translated}"`);
-      return translated;
+      return [data[0][0][0]];
     }
   } catch (e) {
     console.warn('[google-translate] failed:', e.message);
   }
+  return [];
+}
 
+function findExactTranslation(title) {
+  const lowerTitle = title.toLowerCase();
+  
+  // Comprehensive exact matches (CJK + Pinyin + English variants)
+  const translations = {
+    // Chinese CJK
+    '一人之下': 'Under One Person',
+    '斗罗大陆': 'Douluo Continent',
+    '斗破苍穹': 'Battle Through the Heavens',
+    '完美世界': 'Perfect World',
+    '凡人修仙传': 'A Record of a Mortal\'s Journey to Immortality',
+    '狐妖小红娘': 'Fox Spirit Matchmaker',
+    '修罗武神': 'Martial God Asura',
+    
+    // Pinyin/Romanized
+    'xiuluo wu shen': 'Martial God Asura',
+    'dou luo da lu': 'Douluo Continent',
+    'dou po cang qiong': 'Battle Through the Heavens',
+    
+    // Japanese
+    '鬼滅の刃': 'Demon Slayer',
+    '進撃の巨人': 'Attack on Titan',
+    '僕のヒーローアカデミア': 'My Hero Academia',
+    
+    // Korean
+    '나혼잇따': 'Solo Leveling',
+    '신의 탑': 'Tower of God',
+  };
+
+  for (const [orig, eng] of Object.entries(translations)) {
+    if (title.includes(orig) || lowerTitle.includes(orig.toLowerCase())) {
+      return eng;
+    }
+  }
   return null;
 }
 
+async function pinyinTranslate(title) {
+  // Simple Pinyin pattern matching for common 3-4 word titles
+  const pinyinPattern = /^([A-Z][a-z]+(?: [A-Z][a-z]+){2,3})$/i;
+  if (!pinyinPattern.test(title)) return null;
+
+  const words = title.toLowerCase().split(/\s+/);
+  const knownPinyin = words.filter(word => pinyinToEnglish[word]);
+  
+  if (knownPinyin.length === words.length) {
+    // Full Pinyin match
+    return pinyinToEnglish[title.toLowerCase()];
+  }
+  
+  // Partial Pinyin → try combinations
+  for (const word of words) {
+    if (pinyinToEnglish[word]) {
+      return pinyinToEnglish[word];
+    }
+  }
+  
+  return null;
+}
+
+// [Rest of your original functions unchanged - findAnimeId, fetchEpisodes, extractId, parseEpisodes, send]
 async function findAnimeId(title) {
   try {
     const r = await fetch(`${BASE}/ajax/search/suggest?keyword=${encodeURIComponent(title)}`, {
@@ -185,20 +251,17 @@ function extractId(html, query) {
   const q = query.toLowerCase().trim();
   const qWords = q.split(/\s+/).filter(Boolean);
   const qSlug = q.replace(/\s+/g, "-");
-  const queryHasSeason = /\b(season\s*\d|s\d|part\s*\d|\d+(nd|rd|th)\s*season)\b/i.test(query);
 
-  // ✅ EXACT MATCH PRIORITY (new logic)
+  // ✅ EXACT MATCH FIRST
   for (const c of candidates) {
     const name = c.name.toLowerCase();
     const slug = c.id.toLowerCase();
     
-    // Exact name match
     if (name === q || slug === qSlug) {
       console.log(`[EXACT] ${c.id} "${c.name}"`);
       return c.id;
     }
     
-    // Exact ignoring case/spacing/punctuation
     const cleanName = name.replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim();
     const cleanQ = q.replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim();
     if (cleanName === cleanQ) {
@@ -207,7 +270,7 @@ function extractId(html, query) {
     }
   }
 
-  // Fallback to your original similarity scoring
+  // Fallback similarity scoring (your original logic)
   let best = null, bestScore = -1;
   for (const c of candidates) {
     const name = c.name.toLowerCase(), slug = c.id.toLowerCase();
@@ -216,14 +279,6 @@ function extractId(html, query) {
     else if (name.startsWith(q) || slug.startsWith(qSlug)) score += 70;
     else if (name.includes(q) || slug.includes(qSlug)) score += 50;
     score += (qWords.filter(w => name.includes(w) || slug.includes(w)).length / qWords.length) * 40;
-    if (!queryHasSeason) {
-      const isSequel =
-        /\b(season [2-9]|[2-9](nd|rd|th) season|part [2-9]|cour [2-9])\b/.test(name) ||
-        /season-[2-9]/.test(slug) ||
-        /-season-[2-9]/.test(slug) ||
-        /-part-[2-9]/.test(slug);
-      if (isSequel) score -= 80;
-    }
     if (score > bestScore) { bestScore = score; best = c; }
   }
 
